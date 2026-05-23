@@ -48,6 +48,16 @@ docker/artifacts/
 **/docs/_build/*
 **/generated/*
 
+# Local exploration notes and environment prototypes
+/envs/
+/AIRGYM_EXPLORATION_RESEARCH_BASE.md
+/CONTROLLERS.md
+/DEPTH_OCCUPANCY_GRID_IMPLEMENTATION.md
+/EXPLORATION_GRID_HELPER_IMPLEMENTATION.md
+/ISAACLAB_PORT_AGENT.md
+/WANDB_AIRGYM_GUIDE.md
+/source/isaaclab_tasks/isaaclab_tasks/direct/airgym_x152b/airgym_x152b_exploration_env_policy_research.md
+
 # Isaac-Sim packman
 _isaac_sim*
 _repo
