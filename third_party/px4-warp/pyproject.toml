@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "px4-warp"
+version = "0.1.0"
+description = "GPU-native batched PX4-style quadrotor controllers implemented as NVIDIA Warp kernels for vectorized RL environments."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "rlPx4Controller contributors" }]
+keywords = ["px4", "quadrotor", "controller", "warp", "reinforcement-learning", "isaaclab", "gpu"]
+
+# These are expected to already be provided by the target (IsaacLab) environment.
+# Loose specifiers avoid pip replacing the CUDA-enabled torch / local Warp build.
+dependencies = [
+    "warp-lang>=1.0",
+    "torch>=2.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest", "numpy>=1.23"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+px4_warp = ["py.typed"]

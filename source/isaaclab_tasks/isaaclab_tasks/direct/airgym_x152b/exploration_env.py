@@ -14,13 +14,14 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.coverage import CoverageGrid2D, CoverageGrid2DCfg
 from isaaclab.utils.math import quat_apply, quat_from_euler_xyz
+from isaaclab.utils.vae import DepthVAEEncoder
+
+from warp_perception import GridSpec, WarpRoomPerception
 
 from .base_env import AirGymX152bBaseEnv
 from .base_env_cfg import AirGymX152bBaseEnvCfg
 from .exploration_helpers import (
-    build_critic_grid_from_depth,
     build_room_object_state,
-    build_room_visibility_grid_from_depth,
     sample_pillar_positions,
     sample_spawn_positions,
     sample_yaws,
@@ -28,7 +29,6 @@ from .exploration_helpers import (
 from .task_common import (
     make_contact_sensor_cfg,
     make_exploration_room_cfg,
-    make_onboard_camera_cfg,
     make_plane_cfg,
 )
 
@@ -52,7 +52,25 @@ CRITIC_GRID_INFLATION_RADIUS = 1
 COVERAGE_CELL_SIZE = 0.5
 VISIBILITY_GRID_CELL_SIZE = 0.5
 VISIBILITY_GRID_Z_LIMITS = (0.2, WALL_HEIGHT)
-VISIBILITY_GRID_STRIDE = CRITIC_GRID_STRIDE
+# Warp perception camera: matches the VAE training domain (HFOV ~87 deg, 16:9,
+# 10 m range). 135x240 upsamples cleanly (x2 nearest) to the VAE's 270x480 input.
+PERCEPTION_WIDTH = 240
+PERCEPTION_HEIGHT = 135
+PERCEPTION_HFOV_DEG = 87.0
+PERCEPTION_MAX_RANGE = 10.0
+PERCEPTION_FREE_SAMPLES = 48
+# Box half-extents in collection order (walls N, S, E, W; then pillars), derived
+# from the cuboid sizes in make_exploration_room_cfg().
+WALL_HALF_EXTENTS = torch.tensor(
+    [
+        [5.3, 0.1, 0.5 * WALL_HEIGHT],  # north (10.6 x 0.2 x 2.2)
+        [5.3, 0.1, 0.5 * WALL_HEIGHT],  # south
+        [0.1, 5.3, 0.5 * WALL_HEIGHT],  # east (0.2 x 10.6 x 2.2)
+        [0.1, 5.3, 0.5 * WALL_HEIGHT],  # west
+    ],
+    dtype=torch.float32,
+)
+PILLAR_HALF_EXTENT = (0.25, 0.25, 0.5 * PILLAR_HEIGHT)  # 0.5 x 0.5 x 2.2
 PATH_COVERAGE_REWARD_SCALE = 0.5
 FREE_INFO_GAIN_REWARD_SCALE = 1.0
 OCCUPIED_INFO_GAIN_REWARD_SCALE = 0.5
@@ -69,10 +87,25 @@ class AirGymX152bExplorationEnvCfg(AirGymX152bBaseEnvCfg):
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=64, env_spacing=14.0, replicate_physics=True)
     terrain = make_plane_cfg()
     contact_sensor = make_contact_sensor_cfg()
-    onboard_camera = make_onboard_camera_cfg()
+    # No RTX camera: perception is produced by the Warp sensor, so sim.render()
+    # is skipped entirely during headless training.
+    onboard_camera = None
     obstacles = make_exploration_room_cfg(8)
+    camera_max_distance = PERCEPTION_MAX_RANGE
     camera_additive_noise_std = 0.1
     camera_multiplicative_noise_std = 0.3
+
+    # Warp perception sensor configuration.
+    perception_width = PERCEPTION_WIDTH
+    perception_height = PERCEPTION_HEIGHT
+    perception_hfov_deg = PERCEPTION_HFOV_DEG
+    perception_free_samples = PERCEPTION_FREE_SAMPLES
+    perception_use_cuda_graph = False
+
+    # Frozen depth-VAE encoder (visual observation backbone).
+    vae_weights_path: str | None = None
+    vae_latent_dims = 64
+    vae_return_sampled_latent = False
 
     def __post_init__(self):
         super().__post_init__()
@@ -87,6 +120,15 @@ class AirGymX152bExplorationEnv(AirGymX152bBaseEnv):
         self._wall_xy = WALL_XY.to(device=self.device)
         self._num_walls = int(self._wall_xy.shape[0])
         self._num_pillars = self._obstacles.num_objects - self._num_walls
+
+        self._setup_perception()
+        self._vae = DepthVAEEncoder(
+            weights_path=self.cfg.vae_weights_path,
+            latent_dims=self.cfg.vae_latent_dims,
+            max_range=self.cfg.camera_max_distance,
+            return_sampled_latent=self.cfg.vae_return_sampled_latent,
+            device=self.device,
+        )
         self._coverage_grid = CoverageGrid2D(
             CoverageGrid2DCfg(
                 x_limits=ROOM_X_LIMITS,
@@ -110,6 +152,15 @@ class AirGymX152bExplorationEnv(AirGymX152bBaseEnv):
         self._known_occupied = torch.zeros_like(self._known_free)
         self._last_new_free_cells = torch.zeros((self.num_envs,), device=self.device, dtype=torch.long)
         self._last_new_occupied_cells = torch.zeros((self.num_envs,), device=self.device, dtype=torch.long)
+        self._episode_metric_sums = {
+            "info_gain_reward": torch.zeros((self.num_envs,), device=self.device),
+            "coverage_reward": torch.zeros((self.num_envs,), device=self.device),
+            "proximity_penalty": torch.zeros((self.num_envs,), device=self.device),
+            "collision_penalty": torch.zeros((self.num_envs,), device=self.device),
+        }
+        self._last_collision_termination = torch.zeros((self.num_envs,), device=self.device, dtype=torch.bool)
+        self._last_out_of_bounds_termination = torch.zeros((self.num_envs,), device=self.device, dtype=torch.bool)
+        self._last_bad_height_termination = torch.zeros((self.num_envs,), device=self.device, dtype=torch.bool)
 
         x_centers = ROOM_X_LIMITS[0] + VISIBILITY_GRID_CELL_SIZE * (
             torch.arange(self._visibility_grid_h, device=self.device, dtype=torch.float32) + 0.5
@@ -123,6 +174,41 @@ class AirGymX152bExplorationEnv(AirGymX152bBaseEnv):
             ROOM_X_LIMITS[1] - ROOM_X_LIMITS[0],
             ROOM_Y_LIMITS[1] - ROOM_Y_LIMITS[0],
         )
+
+    def _reset_idx(self, env_ids: torch.Tensor | None):
+        if env_ids is None or len(env_ids) == self.num_envs:
+            env_ids = self._robot._ALL_INDICES
+
+        self._log_completed_episode_metrics(env_ids)
+        super()._reset_idx(env_ids)
+
+    def _setup_perception(self) -> None:
+        """Construct the fused Warp perception sensor and push static box geometry."""
+        num_boxes = int(self._obstacles.num_objects)
+        critic_grid = GridSpec(
+            CRITIC_GRID_X_LIMITS, CRITIC_GRID_Y_LIMITS, CRITIC_GRID_Z_LIMITS, CRITIC_GRID_CELL_SIZE
+        )
+        vis_grid = GridSpec(ROOM_X_LIMITS, ROOM_Y_LIMITS, VISIBILITY_GRID_Z_LIMITS, VISIBILITY_GRID_CELL_SIZE)
+        self._perception = WarpRoomPerception(
+            self.num_envs,
+            num_boxes,
+            height=self.cfg.perception_height,
+            width=self.cfg.perception_width,
+            horizontal_fov_deg=self.cfg.perception_hfov_deg,
+            max_range=self.cfg.camera_max_distance,
+            critic_grid=critic_grid,
+            vis_grid=vis_grid,
+            grid_stride=CRITIC_GRID_STRIDE,
+            free_samples=self.cfg.perception_free_samples,
+            device=self.device,
+            use_cuda_graph=self.cfg.perception_use_cuda_graph,
+        )
+        self._perception.set_env_origins(self._env_origins)
+        pillar_half = torch.tensor(PILLAR_HALF_EXTENT, device=self.device, dtype=torch.float32).expand(
+            self._num_pillars, 3
+        )
+        box_half = torch.cat((WALL_HALF_EXTENTS.to(self.device), pillar_half), dim=0)
+        self._perception.set_box_half_extents(box_half)
 
     def _reset_task(self, env_ids: torch.Tensor):
         num_resets = len(env_ids)
@@ -154,6 +240,10 @@ class AirGymX152bExplorationEnv(AirGymX152bBaseEnv):
             pillar_height=PILLAR_HEIGHT,
         )
         self._write_object_collection_state_local(self._obstacles, env_ids, obstacle_pos, obstacle_quat)
+        # Push the new world-frame box transforms to the Warp sensor (analytic
+        # ray-casting reads these directly; no sim read-back / re-render needed).
+        box_center_w = obstacle_pos + self._env_origins[env_ids].unsqueeze(1)
+        self._perception.set_box_transforms(box_center_w, obstacle_quat, env_ids)
 
         quat = quat_from_euler_xyz(
             torch.zeros_like(spawn_yaw),
@@ -171,28 +261,21 @@ class AirGymX152bExplorationEnv(AirGymX152bBaseEnv):
         self._last_new_free_cells[env_ids] = 0
         self._last_new_occupied_cells[env_ids] = 0
 
+        # Robot/obstacle poses were just written, so root_pos_w already reflects the
+        # new spawn. Recompute perception (all envs) and seed the reset envs' known
+        # space from their initial post-reset view.
+        self._update_perception(force=True)
+        self._update_known_space_from_depth(env_ids)
+
     def _resolve_map_env_ids(self, env_ids: torch.Tensor | None) -> torch.Tensor:
         if env_ids is None:
             return torch.arange(self.num_envs, device=self.device, dtype=torch.long)
         return env_ids.to(device=self.device, dtype=torch.long)
 
     def _room_visibility_grid(self) -> torch.Tensor:
-        if self._onboard_camera is None:
-            raise RuntimeError("This task does not define an onboard camera.")
-
-        return build_room_visibility_grid_from_depth(
-            self._camera_depth_metric_image(),
-            self._onboard_camera.data.intrinsic_matrices,
-            camera_pos_w=self._onboard_camera.data.pos_w,
-            camera_quat_ros=self._onboard_camera.data.quat_w_ros,
-            env_origins=self._env_origins,
-            camera_max_distance=self.cfg.camera_max_distance,
-            x_limits=ROOM_X_LIMITS,
-            y_limits=ROOM_Y_LIMITS,
-            z_limits=VISIBILITY_GRID_Z_LIMITS,
-            cell_size=VISIBILITY_GRID_CELL_SIZE,
-            stride=VISIBILITY_GRID_STRIDE,
-        )
+        """Env-local free/occupied visibility grid for this step (from Warp)."""
+        self._update_perception()
+        return self._perception.visibility_grid
 
     def _update_known_space_from_depth(self, env_ids: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         env_ids = self._resolve_map_env_ids(env_ids)
@@ -284,41 +367,40 @@ class AirGymX152bExplorationEnv(AirGymX152bBaseEnv):
         )
 
     def _critic_grid_observation(self) -> torch.Tensor:
-        if self._onboard_camera is None:
-            raise RuntimeError("This task does not define an onboard camera.")
+        """Ego-local two-channel critic occupancy grid from the Warp sensor.
 
-        depth = self._camera_depth_metric_image()
-        world_to_local, _, _, _ = self._compute_yaw_local_frame()
-        return build_critic_grid_from_depth(
-            depth,
-            self._onboard_camera.data.intrinsic_matrices,
-            camera_pos_w=self._onboard_camera.data.pos_w,
-            camera_quat_ros=self._onboard_camera.data.quat_w_ros,
-            root_pos_w=self._robot.data.root_pos_w,
-            world_to_local=world_to_local,
-            camera_max_distance=self.cfg.camera_max_distance,
-            x_limits=CRITIC_GRID_X_LIMITS,
-            y_limits=CRITIC_GRID_Y_LIMITS,
-            z_limits=CRITIC_GRID_Z_LIMITS,
-            cell_size=CRITIC_GRID_CELL_SIZE,
-            stride=CRITIC_GRID_STRIDE,
-            inflation_radius=CRITIC_GRID_INFLATION_RADIUS,
-        )
+        Mirrors the previous PyTorch helper's semantics: occupied cells are
+        dilated by one cell and free cells beneath occupied ones are cleared.
+        """
+        self._update_perception()
+        grid = self._perception.critic_grid
+        occupied = grid[:, 1]
+        if CRITIC_GRID_INFLATION_RADIUS > 0:
+            ksize = 2 * CRITIC_GRID_INFLATION_RADIUS + 1
+            occupied = F.max_pool2d(
+                occupied.unsqueeze(1), ksize, stride=1, padding=CRITIC_GRID_INFLATION_RADIUS
+            ).squeeze(1)
+        free = torch.where(occupied > 0, torch.zeros_like(grid[:, 0]), grid[:, 0])
+        return torch.stack((free, occupied), dim=1)
 
     def _get_task_observations(self) -> dict[str, torch.Tensor]:
-        reset_env_ids = (self.episode_length_buf == 0).nonzero(as_tuple=False).squeeze(-1)
-        if reset_env_ids.numel() > 0:
-            self._update_known_space_from_depth(reset_env_ids)
-
+        # Perception (depth/critic/visibility) is refreshed for all envs in the
+        # reward step and re-run for reset envs inside _reset_task, so the cache is
+        # already valid here. Known-space seeding for reset envs happens in
+        # _reset_task, not here.
+        self._update_perception()
         obs = self._state_observation()
+        latent = self._vae.encode(self._camera_depth_metric_image())
         return {
             "policy": obs,
             "observation": obs,
-            "image": self._camera_depth_image(),
+            "latent": latent,
             "critic_grid": self._critic_grid_observation(),
         }
 
     def _compute_reward_and_metrics(self) -> tuple[torch.Tensor, dict[str, torch.Tensor | float]]:
+        # Refresh perception once (all envs, post-physics) before any consumer.
+        self._update_perception()
         root_pos_local = self._root_pos_local()
         _, _, _, ang_vel_local = self._compute_yaw_local_frame()
         collision = self._collision_state()
@@ -390,19 +472,59 @@ class AirGymX152bExplorationEnv(AirGymX152bBaseEnv):
             "height_penalty": height_penalty,
             "reward": reward,
         }
+        for key in self._episode_metric_sums:
+            self._episode_metric_sums[key] += reward_info[key]
         return reward, reward_info
+
+    def _log_completed_episode_metrics(self, env_ids: torch.Tensor) -> None:
+        episode_lengths = self.episode_length_buf[env_ids].to(dtype=torch.float32)
+        completed_episode = self.reset_terminated[env_ids] | self.reset_time_outs[env_ids]
+        valid_episode = completed_episode & (episode_lengths > 0)
+        if not torch.any(valid_episode):
+            return
+
+        valid_env_ids = env_ids[valid_episode]
+        episode_lengths = episode_lengths[valid_episode].clamp_min(1.0)
+        coverage_ratio = self._coverage_grid.coverage_ratio()[valid_env_ids]
+        known_space_ratio = self._known_space_ratio()[valid_env_ids]
+
+        log = {}
+        for key, value in self._episode_metric_sums.items():
+            log[f"Episode_Reward/{key}_mean"] = torch.mean(value[valid_env_ids] / episode_lengths)
+            value[valid_env_ids] = 0.0
+
+        log["Episode_Termination/collision_rate"] = self._last_collision_termination[valid_env_ids].to(
+            dtype=torch.float32
+        ).mean()
+        log["Episode_Termination/out_of_bounds_rate"] = self._last_out_of_bounds_termination[valid_env_ids].to(
+            dtype=torch.float32
+        ).mean()
+        log["Episode_Termination/bad_height_rate"] = self._last_bad_height_termination[valid_env_ids].to(
+            dtype=torch.float32
+        ).mean()
+        log["Episode_Termination/time_out_rate"] = self.reset_time_outs[valid_env_ids].to(dtype=torch.float32).mean()
+        log["Metrics/coverage_ratio"] = coverage_ratio.mean()
+        log["Metrics/known_space_ratio"] = known_space_ratio.mean()
+
+        self.extras["log"] = log
 
     def _compute_terminated(self) -> torch.Tensor:
         root_pos_local = self._root_pos_local()
         up_axis = torch.tensor([0.0, 0.0, 1.0], device=self.device).repeat(self.num_envs, 1)
         ups = quat_apply(self._robot.data.root_quat_w, up_axis)
 
-        terminated = root_pos_local[:, 0] < ROOM_X_LIMITS[0]
-        terminated |= root_pos_local[:, 0] > ROOM_X_LIMITS[1]
-        terminated |= root_pos_local[:, 1] < ROOM_Y_LIMITS[0]
-        terminated |= root_pos_local[:, 1] > ROOM_Y_LIMITS[1]
-        terminated |= root_pos_local[:, 2] < 0.35
-        terminated |= root_pos_local[:, 2] > 2.0
+        out_of_bounds = root_pos_local[:, 0] < ROOM_X_LIMITS[0]
+        out_of_bounds |= root_pos_local[:, 0] > ROOM_X_LIMITS[1]
+        out_of_bounds |= root_pos_local[:, 1] < ROOM_Y_LIMITS[0]
+        out_of_bounds |= root_pos_local[:, 1] > ROOM_Y_LIMITS[1]
+        bad_height = (root_pos_local[:, 2] < 0.35) | (root_pos_local[:, 2] > 2.0)
+        collision = self._collision_state()
+
+        self._last_out_of_bounds_termination.copy_(out_of_bounds)
+        self._last_bad_height_termination.copy_(bad_height)
+        self._last_collision_termination.copy_(collision)
+
+        terminated = out_of_bounds | bad_height
         terminated |= ups[:, 2] < 0.0
-        terminated |= self._collision_state()
+        terminated |= collision
         return terminated

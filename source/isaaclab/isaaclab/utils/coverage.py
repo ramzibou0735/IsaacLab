@@ -22,6 +22,13 @@ class CoverageGrid2DCfg:
     cell_size: float
     mark_path: bool = True
     count_spawn_as_visited: bool = True
+    max_segment_cells: int = 16
+    """Fixed upper bound on cells sampled per path segment in a single update.
+
+    Using a fixed bound (instead of the data-dependent maximum) keeps
+    :meth:`CoverageGrid2D.update` free of GPU->CPU synchronizations. It must be
+    larger than the most cells any single-step motion can cross
+    (``max_speed * step_dt / cell_size``)."""
 
 
 class CoverageGrid2D:
@@ -52,6 +59,7 @@ class CoverageGrid2D:
         self.grid_h = math.ceil((self.x_max - self.x_min) / self.cell_size)
         self.grid_w = math.ceil((self.y_max - self.y_min) / self.cell_size)
         self.total_cells = self.grid_h * self.grid_w
+        self.max_segment_cells = max(1, int(cfg.max_segment_cells))
 
         self.visited = torch.zeros((self.num_envs, self.grid_h, self.grid_w), device=self.device, dtype=torch.bool)
         self.spawn_cell = torch.zeros((self.num_envs, 2), device=self.device, dtype=torch.long)
@@ -149,8 +157,9 @@ class CoverageGrid2D:
 
         delta = end_xy - start_xy
         steps = torch.ceil(delta.abs().amax(dim=-1) / self.cell_size).long() + 1
-        steps = steps.clamp_min(1)
-        max_steps = int(steps.max().item())
+        # Fixed sample count (no host sync); clamp so a segment never needs more.
+        steps = steps.clamp(1, self.max_segment_cells)
+        max_steps = self.max_segment_cells
 
         step_idx = torch.arange(max_steps, device=self.device, dtype=torch.long).unsqueeze(0)
         step_idx = step_idx.expand(start_xy.shape[0], -1)
@@ -166,23 +175,27 @@ class CoverageGrid2D:
         return sample_cells, sample_valid
 
     def _mark_visited(self, env_ids: torch.Tensor, cells: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
-        """Mark valid cells as visited and return the number of newly visited cells per env."""
-        flat = self.visited.view(self.num_envs, -1)
-        new_visit_count = torch.zeros((env_ids.shape[0],), device=self.device, dtype=torch.long)
+        """Mark valid cells as visited and return the number of newly visited cells per env.
 
-        for batch_id, env_id in enumerate(env_ids.tolist()):
-            valid_mask = valid[batch_id]
-            if not torch.any(valid_mask):
-                continue
-            cell_batch = cells[batch_id, valid_mask]
-            flat_idx = cell_batch[:, 0] * self.grid_w + cell_batch[:, 1]
-            flat_idx = torch.unique(flat_idx)
-            was_unvisited = ~flat[env_id, flat_idx]
-            count = was_unvisited.sum()
-            if count > 0:
-                flat[env_id, flat_idx] = True
-                self.coverage_count[env_id] += count
-                new_visit_count[batch_id] = count
+        Fully vectorized (no Python loop / host sync): invalid samples are routed
+        to a throwaway sentinel column while scattering, so each batch row builds a
+        deduplicated ``to_visit`` mask in one pass.
+        """
+        batch = env_ids.shape[0]
+        # Flatten (row, col) cell indices; send invalid samples to a sentinel column.
+        flat_idx = cells[..., 0] * self.grid_w + cells[..., 1]
+        flat_idx = torch.where(valid, flat_idx, flat_idx.new_full((), self.total_cells))
+
+        to_visit = torch.zeros((batch, self.total_cells + 1), device=self.device, dtype=torch.bool)
+        to_visit.scatter_(1, flat_idx, torch.ones_like(flat_idx, dtype=torch.bool))
+        to_visit = to_visit[:, : self.total_cells]
+
+        visited_flat = self.visited.view(self.num_envs, -1)[env_ids]
+        new_cells = to_visit & ~visited_flat
+        new_visit_count = new_cells.sum(dim=-1)
+
+        self.visited[env_ids] = (visited_flat | to_visit).view(batch, self.grid_h, self.grid_w)
+        self.coverage_count[env_ids] += new_visit_count
         return new_visit_count
 
     def _resolve_env_ids(self, env_ids: torch.Tensor | None) -> torch.Tensor:

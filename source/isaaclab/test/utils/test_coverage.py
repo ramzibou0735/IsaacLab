@@ -100,6 +100,77 @@ def test_update_out_of_bounds_marks_only_valid_cells(device):
         assert bool(grid.visited[0, x_idx, 0].item())
 
 
+def _reference_mark_visited(visited, coverage_count, grid_w, env_ids, cells, valid):
+    """Original per-env loop implementation, used as a parity reference."""
+    flat = visited.view(visited.shape[0], -1)
+    new_visit_count = torch.zeros((env_ids.shape[0],), device=visited.device, dtype=torch.long)
+    for batch_id, env_id in enumerate(env_ids.tolist()):
+        valid_mask = valid[batch_id]
+        if not torch.any(valid_mask):
+            continue
+        cell_batch = cells[batch_id, valid_mask]
+        flat_idx = cell_batch[:, 0] * grid_w + cell_batch[:, 1]
+        flat_idx = torch.unique(flat_idx)
+        was_unvisited = ~flat[env_id, flat_idx]
+        count = was_unvisited.sum()
+        if count > 0:
+            flat[env_id, flat_idx] = True
+            coverage_count[env_id] += count
+            new_visit_count[batch_id] = count
+    return new_visit_count
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_mark_visited_matches_reference_loop(device):
+    """The vectorized _mark_visited must match the original per-env loop output."""
+    torch.manual_seed(3)
+    grid = CoverageGrid2D(
+        CoverageGrid2DCfg(x_limits=(0.0, 4.0), y_limits=(0.0, 4.0), cell_size=1.0),
+        num_envs=5,
+        device=device,
+    )
+    env_ids = torch.arange(5, device=device, dtype=torch.long)
+    steps = 7
+    cells = torch.stack(
+        (
+            torch.randint(0, grid.grid_h, (5, steps), device=device),
+            torch.randint(0, grid.grid_w, (5, steps), device=device),
+        ),
+        dim=-1,
+    )
+    valid = torch.rand((5, steps), device=device) > 0.3
+
+    ref_visited = grid.visited.clone()
+    ref_count = grid.coverage_count.clone()
+    ref_new = _reference_mark_visited(ref_visited, ref_count, grid.grid_w, env_ids, cells, valid)
+
+    new_new = grid._mark_visited(env_ids, cells, valid)
+
+    torch.testing.assert_close(new_new, ref_new)
+    torch.testing.assert_close(grid.visited, ref_visited)
+    torch.testing.assert_close(grid.coverage_count, ref_count)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_cumulative_new_visits_equals_coverage_count(device):
+    """Over a random walk, summed new visits (+ spawn) equal the coverage count."""
+    torch.manual_seed(11)
+    grid = CoverageGrid2D(
+        CoverageGrid2DCfg(x_limits=(-5.0, 5.0), y_limits=(-5.0, 5.0), cell_size=0.5),
+        num_envs=8,
+        device=device,
+    )
+    pos = torch.zeros((8, 2), device=device)
+    grid.reset(None, pos)
+    total_new = torch.ones((8,), device=device, dtype=torch.long)  # spawn counts as 1
+    for _ in range(40):
+        pos = (pos + 0.4 * (2.0 * torch.rand((8, 2), device=device) - 1.0)).clamp(-4.9, 4.9)
+        new_visit_count, _ = grid.update(None, pos)
+        total_new += new_visit_count
+    torch.testing.assert_close(total_new, grid.coverage_count)
+    torch.testing.assert_close(grid.coverage_count, grid.visited.flatten(1).sum(dim=-1))
+
+
 @pytest.mark.parametrize("device", DEVICES)
 def test_partial_reset_preserves_other_envs(device):
     """Test that partial resets only affect selected environments."""

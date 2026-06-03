@@ -10,8 +10,6 @@ from pathlib import Path
 
 import torch
 
-from isaaclab.utils.math import convert_camera_frame_orientation_convention
-
 
 _HELPERS_PATH = (
     Path(__file__).resolve().parents[1]
@@ -25,9 +23,7 @@ assert _SPEC is not None and _SPEC.loader is not None
 _HELPERS = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_HELPERS)
 
-build_critic_grid_from_depth = _HELPERS.build_critic_grid_from_depth
 build_room_object_state = _HELPERS.build_room_object_state
-build_room_visibility_grid_from_depth = _HELPERS.build_room_visibility_grid_from_depth
 sample_pillar_positions = _HELPERS.sample_pillar_positions
 
 
@@ -36,6 +32,9 @@ def _log_test(name: str, detail: str):
 
 
 def test_sample_pillar_positions_respect_clearance_and_spacing():
+    # The de-synced sampler runs a fixed number of rejection iterations (no
+    # bool(torch.all(...)) early break); it must still honor wall bounds, spawn
+    # clearance, and pairwise spacing when valid placements exist.
     _log_test(
         "pillar sampling",
         "samples 6 pillars in 4 rooms and checks wall bounds, spawn clearance, and pairwise spacing",
@@ -79,6 +78,26 @@ def test_sample_pillar_positions_respect_clearance_and_spacing():
         assert torch.all(pairwise >= 1.0)
 
 
+def test_sample_pillar_positions_is_sync_free_and_shaped():
+    # A zero-pillar request returns an empty tensor; non-zero requests always
+    # return a fully populated tensor even under tight constraints (fallback).
+    _log_test("pillar sampling", "checks empty-pillar shortcut and fully-populated fallback output")
+    torch.manual_seed(0)
+
+    empty = sample_pillar_positions(
+        3, 0, "cpu", x_limits=(-5.0, 5.0), y_limits=(-5.0, 5.0), spawn_xy=torch.zeros((3, 2)),
+        wall_margin=1.0, pillar_spacing=1.0, spawn_clearance=1.0,
+    )
+    assert empty.shape == (3, 0, 2)
+
+    filled = sample_pillar_positions(
+        2, 5, "cpu", x_limits=(-2.0, 2.0), y_limits=(-2.0, 2.0), spawn_xy=torch.zeros((2, 2)),
+        wall_margin=0.5, pillar_spacing=0.5, spawn_clearance=0.5, max_tries=8,
+    )
+    assert filled.shape == (2, 5, 2)
+    assert torch.isfinite(filled).all()
+
+
 def test_build_room_object_state_places_walls_first_then_pillars():
     _log_test(
         "room object state",
@@ -100,163 +119,3 @@ def test_build_room_object_state_places_walls_first_then_pillars():
     torch.testing.assert_close(pos[:, :, 2], torch.full((2, 6), 1.1))
     torch.testing.assert_close(quat[..., 0], torch.ones((2, 6)))
     torch.testing.assert_close(quat[..., 1:], torch.zeros((2, 6, 3)))
-
-
-def test_build_critic_grid_from_depth_does_not_mark_max_range_endpoints_occupied():
-    _log_test(
-        "critic depth grid",
-        "checks that finite hits become occupied while max-range depth contributes free space only",
-    )
-    depth = torch.tensor(
-        [[[[1.0, 4.5], [4.5, 4.5]]]],
-        dtype=torch.float32,
-    )
-    intrinsics = torch.tensor(
-        [[[2.0, 0.0, 0.5], [0.0, 2.0, 0.5], [0.0, 0.0, 1.0]]],
-        dtype=torch.float32,
-    )
-    root_pos_w = torch.zeros((1, 3), dtype=torch.float32)
-    world_to_local = torch.eye(3, dtype=torch.float32).unsqueeze(0)
-    quat_w_world = torch.tensor([[1.0, 0.0, 0.0, 0.0]], dtype=torch.float32)
-    camera_quat_ros = convert_camera_frame_orientation_convention(quat_w_world, origin="world", target="ros")
-
-    grid = build_critic_grid_from_depth(
-        depth,
-        intrinsics,
-        camera_pos_w=torch.zeros((1, 3), dtype=torch.float32),
-        camera_quat_ros=camera_quat_ros,
-        root_pos_w=root_pos_w,
-        world_to_local=world_to_local,
-        camera_max_distance=4.5,
-        x_limits=(0.0, 5.0),
-        y_limits=(-2.5, 2.5),
-        z_limits=(-2.0, 2.0),
-        cell_size=1.0,
-        free_samples_per_ray=3,
-        inflation_radius=0,
-    )
-
-    assert grid.shape == (1, 2, 5, 5)
-    _log_test(
-        "critic depth grid",
-        f"free cells={torch.sum(grid[:, 0]).item():.0f}, occupied cells={torch.sum(grid[:, 1]).item():.0f}",
-    )
-    assert torch.sum(grid[:, 1]).item() == 1.0
-    assert torch.sum(grid[:, 0]).item() >= 1.0
-
-
-def test_build_room_visibility_grid_from_depth_marks_free_and_occupied_cells():
-    _log_test(
-        "room visibility grid",
-        "checks camera-origin ray tracing marks the camera cell free and the depth hit occupied in env-local room cells",
-    )
-    depth = torch.tensor(
-        [[[[1.0, 0.0], [0.0, 0.0]]]],
-        dtype=torch.float32,
-    )
-    intrinsics = torch.tensor(
-        [[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]],
-        dtype=torch.float32,
-    )
-    quat_w_world = torch.tensor([[1.0, 0.0, 0.0, 0.0]], dtype=torch.float32)
-    camera_quat_ros = convert_camera_frame_orientation_convention(quat_w_world, origin="world", target="ros")
-
-    grid = build_room_visibility_grid_from_depth(
-        depth,
-        intrinsics,
-        camera_pos_w=torch.tensor([[1.0, 1.0, 1.0]], dtype=torch.float32),
-        camera_quat_ros=camera_quat_ros,
-        env_origins=torch.zeros((1, 3), dtype=torch.float32),
-        camera_max_distance=4.5,
-        x_limits=(0.0, 4.0),
-        y_limits=(0.0, 4.0),
-        z_limits=(0.0, 3.0),
-        cell_size=1.0,
-        free_samples_per_ray=3,
-    )
-
-    assert grid.shape == (1, 2, 4, 4)
-    _log_test(
-        "room visibility grid",
-        f"expected free cell (1, 1)={grid[0, 0, 1, 1].item():.0f}, "
-        f"occupied cell (2, 1)={grid[0, 1, 2, 1].item():.0f}",
-    )
-    assert grid[0, 0, 1, 1].item() == 1.0
-    assert grid[0, 1, 2, 1].item() == 1.0
-
-
-def test_build_room_visibility_grid_from_depth_does_not_mark_max_range_endpoints_occupied():
-    _log_test(
-        "room visibility max range",
-        "checks max-range depth produces free-space evidence but no occupied endpoint",
-    )
-    depth = torch.tensor(
-        [[[[4.5, 0.0], [0.0, 0.0]]]],
-        dtype=torch.float32,
-    )
-    intrinsics = torch.tensor(
-        [[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]],
-        dtype=torch.float32,
-    )
-    quat_w_world = torch.tensor([[1.0, 0.0, 0.0, 0.0]], dtype=torch.float32)
-    camera_quat_ros = convert_camera_frame_orientation_convention(quat_w_world, origin="world", target="ros")
-
-    grid = build_room_visibility_grid_from_depth(
-        depth,
-        intrinsics,
-        camera_pos_w=torch.tensor([[1.0, 1.0, 1.0]], dtype=torch.float32),
-        camera_quat_ros=camera_quat_ros,
-        env_origins=torch.zeros((1, 3), dtype=torch.float32),
-        camera_max_distance=4.5,
-        x_limits=(0.0, 6.0),
-        y_limits=(0.0, 4.0),
-        z_limits=(0.0, 3.0),
-        cell_size=1.0,
-        free_samples_per_ray=5,
-    )
-
-    _log_test(
-        "room visibility max range",
-        f"free cells={torch.sum(grid[:, 0]).item():.0f}, occupied cells={torch.sum(grid[:, 1]).item():.0f}",
-    )
-    assert torch.sum(grid[:, 1]).item() == 0.0
-    assert torch.sum(grid[:, 0]).item() > 0.0
-
-
-def test_build_room_visibility_grid_from_depth_uses_env_local_coordinates():
-    _log_test(
-        "room visibility env-local frame",
-        "checks world camera pose and env origin are converted into the same env-local cells as the unshifted case",
-    )
-    depth = torch.tensor(
-        [[[[1.0, 0.0], [0.0, 0.0]]]],
-        dtype=torch.float32,
-    )
-    intrinsics = torch.tensor(
-        [[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]],
-        dtype=torch.float32,
-    )
-    quat_w_world = torch.tensor([[1.0, 0.0, 0.0, 0.0]], dtype=torch.float32)
-    camera_quat_ros = convert_camera_frame_orientation_convention(quat_w_world, origin="world", target="ros")
-
-    grid = build_room_visibility_grid_from_depth(
-        depth,
-        intrinsics,
-        camera_pos_w=torch.tensor([[11.0, 21.0, 1.0]], dtype=torch.float32),
-        camera_quat_ros=camera_quat_ros,
-        env_origins=torch.tensor([[10.0, 20.0, 0.0]], dtype=torch.float32),
-        camera_max_distance=4.5,
-        x_limits=(0.0, 4.0),
-        y_limits=(0.0, 4.0),
-        z_limits=(0.0, 3.0),
-        cell_size=1.0,
-        free_samples_per_ray=3,
-    )
-
-    _log_test(
-        "room visibility env-local frame",
-        f"shifted free cell (1, 1)={grid[0, 0, 1, 1].item():.0f}, "
-        f"shifted occupied cell (2, 1)={grid[0, 1, 2, 1].item():.0f}",
-    )
-    assert grid[0, 0, 1, 1].item() == 1.0
-    assert grid[0, 1, 2, 1].item() == 1.0

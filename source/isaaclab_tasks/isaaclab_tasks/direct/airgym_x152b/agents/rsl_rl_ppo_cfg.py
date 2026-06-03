@@ -170,7 +170,11 @@ class AirGymX152bPlanningPPORunnerCfg(AirGymX152bVisionPPORunnerCfg):
 class AirGymX152bExplorationPPORunnerCfg(AirGymX152bVisionPPORunnerCfg):
     experiment_name = "airgym_x152b_exploration"
     max_iterations = 2500
-    obs_groups = {"actor": ["observation", "image"], "critic": ["observation", "critic_grid"]}
+    # Actor: MLP over the state vector + frozen-VAE depth latent (no CNN).
+    # Critic: CNN over the state vector + Warp-built ego-local occupancy grid.
+    obs_groups = {"actor": ["observation", "latent"], "critic": ["observation", "critic_grid"]}
+    actor = MLP_ACTOR_CFG.copy()
+    critic = VISION_CRITIC_CFG.copy()
     algorithm = ASYMMETRIC_VISION_ALGORITHM_CFG.copy()
 
 
@@ -178,7 +182,7 @@ class AirGymX152bExplorationPPORunnerCfg(AirGymX152bVisionPPORunnerCfg):
 class AirGymX152bExplorationRndPPORunnerCfg(AirGymX152bExplorationPPORunnerCfg):
     experiment_name = "airgym_x152b_exploration_rnd"
     obs_groups = {
-        "actor": ["observation", "image"],
+        "actor": ["observation", "latent"],
         "critic": ["observation", "critic_grid"],
         "rnd_state": ["observation"],
     }

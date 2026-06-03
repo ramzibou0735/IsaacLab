@@ -77,6 +77,9 @@ class AirGymX152bBaseEnvCfg(DirectRLEnvCfg):
     camera_max_distance = 4.5
     camera_additive_noise_std = 0.0
     camera_multiplicative_noise_std = 0.0
+    # Body-frame translation of the depth sensor (matches the onboard-camera offset).
+    # Used by the Warp perception sensor to place the virtual camera.
+    camera_offset_pos = (0.15, 0.0, 0.1)
 
     pos_action_limits = ((-3.0, -3.0, -3.0, -6.0), (3.0, 3.0, 3.0, 6.0))
     vel_action_limits = ((-6.0, -6.0, -6.0, -6.0), (6.0, 6.0, 6.0, 6.0))

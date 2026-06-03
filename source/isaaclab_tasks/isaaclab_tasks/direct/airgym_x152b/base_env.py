@@ -8,7 +8,6 @@ from __future__ import annotations
 from abc import abstractmethod
 
 import gymnasium as gym
-import numpy as np
 import torch
 
 import isaaclab.sim as sim_utils
@@ -19,11 +18,12 @@ from isaaclab.utils.math import (
     euler_xyz_from_quat,
     matrix_from_quat,
     normalize,
+    quat_apply,
     quat_from_matrix,
     quat_unique,
     wrap_to_pi,
 )
-from rlPx4Controller.pyParallelControl import (
+from px4_warp import (
     ParallelAttiControl,
     ParallelPosControl,
     ParallelRateControl,
@@ -54,6 +54,13 @@ class AirGymX152bBaseEnv(DirectRLEnv):
         self._obstacles = getattr(self, "_obstacles", None)
         self._contact_sensor = getattr(self, "_contact_sensor", None)
         self._onboard_camera = getattr(self, "_onboard_camera", None)
+        # Optional GPU-native perception sensor (set up by subclasses, e.g. exploration).
+        self._perception = getattr(self, "_perception", None)
+        self._perception_valid = False
+        self._yaw_frame_cache: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+        self._cam_offset_b = torch.tensor(self.cfg.camera_offset_pos, device=self.device, dtype=torch.float32).view(
+            1, 3
+        )
 
         self._prop_body_ids = torch.tensor(
             self._robot.find_bodies(["prop_1", "prop_2", "prop_3", "prop_4"], preserve_order=True)[0],
@@ -81,6 +88,7 @@ class AirGymX152bBaseEnv(DirectRLEnv):
         self._terrain = None
         self._contact_sensor = None
         self._onboard_camera = None
+        self._perception = None
         self._balloon = None
         self._moving_obstacle = None
         self._goal = None
@@ -137,13 +145,13 @@ class AirGymX152bBaseEnv(DirectRLEnv):
 
     def _build_controller(self):
         if self.cfg.ctl_mode == "pos":
-            return ParallelPosControl(self.num_envs)
+            return ParallelPosControl(self.num_envs, device=self.device)
         if self.cfg.ctl_mode == "vel":
-            return ParallelVelControl(self.num_envs)
+            return ParallelVelControl(self.num_envs, device=self.device)
         if self.cfg.ctl_mode == "atti":
-            return ParallelAttiControl(self.num_envs)
+            return ParallelAttiControl(self.num_envs, device=self.device)
         if self.cfg.ctl_mode == "rate":
-            return ParallelRateControl(self.num_envs)
+            return ParallelRateControl(self.num_envs, device=self.device)
         if self.cfg.ctl_mode == "prop":
             return None
         raise ValueError(f"Unsupported control mode: {self.cfg.ctl_mode}")
@@ -151,6 +159,8 @@ class AirGymX152bBaseEnv(DirectRLEnv):
     def _pre_physics_step(self, actions: torch.Tensor):
         self._camera_image = None
         self._camera_metric_image = None
+        self._perception_valid = False
+        self._yaw_frame_cache = None
         self._policy_actions = actions.clone()
         processed_actions = actions.clone()
         if self.cfg.ctl_mode in {"rate", "atti"}:
@@ -161,29 +171,23 @@ class AirGymX152bBaseEnv(DirectRLEnv):
         if self._controller is None:
             self._cmd_thrusts = processed_actions
         else:
-            root_pos_local = self._root_pos_local().detach().cpu().numpy().astype(np.float64)
-            root_quat_w = quat_unique(self._robot.data.root_quat_w).detach().cpu().numpy().astype(np.float64)
-            root_lin_vel = self._robot.data.root_lin_vel_w.detach().cpu().numpy().astype(np.float64)
-            root_ang_vel = self._robot.data.root_ang_vel_w.detach().cpu().numpy().astype(np.float64)
-            actions_cpu = processed_actions.detach().cpu().numpy().astype(np.float64)
+            root_pos_local = self._root_pos_local().contiguous()
+            root_quat_w = quat_unique(self._robot.data.root_quat_w).contiguous()
+            root_lin_vel = self._robot.data.root_lin_vel_w.contiguous()
+            root_ang_vel = self._robot.data.root_ang_vel_w.contiguous()
+            actions_gpu = processed_actions.contiguous()
             dt = float(self.step_dt)
 
-            if self.cfg.ctl_mode == "pos":
+            if self.cfg.ctl_mode in {"pos", "vel", "atti"}:
                 self._controller.set_status(root_pos_local, root_quat_w, root_lin_vel, root_ang_vel, dt)
-                cmd_thrusts = self._controller.update(actions_cpu)
-            elif self.cfg.ctl_mode == "vel":
-                self._controller.set_status(root_pos_local, root_quat_w, root_lin_vel, root_ang_vel, dt)
-                cmd_thrusts = self._controller.update(actions_cpu)
-            elif self.cfg.ctl_mode == "atti":
-                self._controller.set_status(root_pos_local, root_quat_w, root_lin_vel, root_ang_vel, dt)
-                cmd_thrusts = self._controller.update(actions_cpu)
+                cmd_thrusts = self._controller.update(actions_gpu)
             elif self.cfg.ctl_mode == "rate":
                 self._controller.set_q_world(root_quat_w)
-                cmd_thrusts = self._controller.update(actions_cpu, root_ang_vel, dt)
+                cmd_thrusts = self._controller.update(actions_gpu, root_ang_vel, dt)
             else:
                 raise ValueError(f"Unsupported control mode: {self.cfg.ctl_mode}")
 
-            self._cmd_thrusts = torch.tensor(cmd_thrusts, device=self.device, dtype=torch.float32)
+            self._cmd_thrusts = cmd_thrusts.clone()
 
         self._rotor_forces.zero_()
         self._rotor_forces[:, :, 2] = self._cmd_thrusts * self.cfg.thrust_to_force
@@ -242,6 +246,11 @@ class AirGymX152bBaseEnv(DirectRLEnv):
         self._rotor_torques[env_ids] = 0.0
         self._robot.permanent_wrench_composer.reset(env_ids)
 
+        # Reset teleports robots/obstacles, so any cached yaw frame or perception
+        # from the pre-reset reward step is stale. Invalidate before _reset_task,
+        # which may recompute perception with the new post-reset poses.
+        self._yaw_frame_cache = None
+        self._perception_valid = False
         self._reset_task(env_ids)
         self._camera_image = None
         self._camera_metric_image = None
@@ -257,6 +266,10 @@ class AirGymX152bBaseEnv(DirectRLEnv):
         return torch.stack((roll, pitch, yaw), dim=-1)
 
     def _compute_yaw_local_frame(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Cached once per step (invalidated in _pre_physics_step and on reset);
+        # the yaw-local frame is read by state obs, perception, and rewards.
+        if self._yaw_frame_cache is not None:
+            return self._yaw_frame_cache
         rotation_global = self._root_rotation_matrix()
         yaw = torch.atan2(rotation_global[:, 1, 0], rotation_global[:, 0, 0])
         cos_yaw = torch.cos(yaw)
@@ -277,7 +290,8 @@ class AirGymX152bBaseEnv(DirectRLEnv):
         euler_local = torch.stack((roll, pitch, yaw_local), dim=-1)
         lin_vel_local = torch.einsum("bij,bj->bi", world_to_local, self._robot.data.root_lin_vel_w)
         ang_vel_local = torch.einsum("bij,bj->bi", world_to_local, self._robot.data.root_ang_vel_w)
-        return world_to_local, euler_local, lin_vel_local, ang_vel_local
+        self._yaw_frame_cache = (world_to_local, euler_local, lin_vel_local, ang_vel_local)
+        return self._yaw_frame_cache
 
     def _collision_state(self) -> torch.Tensor:
         if self._contact_sensor is None:
@@ -285,17 +299,48 @@ class AirGymX152bBaseEnv(DirectRLEnv):
         net_forces = self._contact_sensor.data.net_forces_w
         return torch.linalg.vector_norm(net_forces, dim=-1).amax(dim=-1) > self.cfg.contact_force_threshold
 
+    def _update_perception(self, force: bool = False) -> None:
+        """Run the Warp perception sensor for all envs and cache its outputs.
+
+        Computes the world-frame camera pose from the (post-physics or post-reset)
+        robot root pose plus the body-frame offset, then launches the fused kernel.
+        Box transforms are persistent in the sensor (set on reset), so no per-step
+        box copy is needed. No-op for tasks without a perception sensor.
+        """
+        if self._perception is None:
+            return
+        if self._perception_valid and not force:
+            return
+        if force:
+            # Poses changed (reset); drop the cached yaw frame so it is recomputed.
+            self._yaw_frame_cache = None
+        world_to_local, _, _, _ = self._compute_yaw_local_frame()
+        root_pos_w = self._robot.data.root_pos_w
+        root_quat_w = self._robot.data.root_quat_w
+        cam_pos_w = root_pos_w + quat_apply(root_quat_w, self._cam_offset_b.expand(self.num_envs, -1))
+        # Camera offset rotation is identity, so the camera shares the body orientation.
+        self._perception.compute(cam_pos_w, root_quat_w, world_to_local, root_pos_w)
+        self._perception_valid = True
+        # Depth buffer changed; invalidate derived (noisy/normalized) caches.
+        self._camera_metric_image = None
+        self._camera_image = None
+
     def _camera_depth_metric_image(self) -> torch.Tensor:
-        if self._onboard_camera is None:
-            raise RuntimeError("This task does not define an onboard camera.")
+        if self._perception is None and self._onboard_camera is None:
+            raise RuntimeError("This task does not define an onboard camera or perception sensor.")
 
         if self._camera_metric_image is None:
-            depth = self._onboard_camera.data.output["depth"].permute(0, 3, 1, 2).contiguous()
+            if self._perception is not None:
+                self._update_perception()
+                # Warp depth is (N, H, W); match the (N, 1, H, W) layout of the RTX path.
+                depth = self._perception.depth.unsqueeze(1)
+            else:
+                depth = self._onboard_camera.data.output["depth"].permute(0, 3, 1, 2).contiguous()
             if self.cfg.camera_additive_noise_std > 0.0:
                 depth = depth + self.cfg.camera_additive_noise_std * self.cfg.camera_max_distance * torch.randn_like(depth)
             if self.cfg.camera_multiplicative_noise_std > 0.0:
                 depth = depth * (1.0 + self.cfg.camera_multiplicative_noise_std * torch.randn_like(depth))
-            self._camera_metric_image = depth.clamp_(0.0, self.cfg.camera_max_distance)
+            self._camera_metric_image = depth.clamp(0.0, self.cfg.camera_max_distance)
         return self._camera_metric_image
 
     def _camera_depth_image(self) -> torch.Tensor:
