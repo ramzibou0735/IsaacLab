@@ -32,6 +32,12 @@ parser.add_argument(
 )
 parser.add_argument("--export_io_descriptors", action="store_true", default=False, help="Export IO descriptors.")
 parser.add_argument(
+    "--vae",
+    action="store_true",
+    default=False,
+    help="Enable VAE latent visual observations for tasks that support it.",
+)
+parser.add_argument(
     "--ray-proc-id", "-rid", type=int, default=None, help="Automatically configured by Ray integration, otherwise None."
 )
 # append RSL-RL cli arguments
@@ -111,6 +117,17 @@ torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
 
 
+def _enable_vae_mode(env_cfg: DirectRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
+    if not hasattr(env_cfg, "set_vae_mode"):
+        raise ValueError(f"--vae was requested, but task '{args_cli.task}' does not expose a VAE mode.")
+    env_cfg.set_vae_mode(True)
+    if hasattr(agent_cfg, "obs_groups"):
+        agent_cfg.obs_groups["actor"] = ["observations", "observations_vae", "observations_map"]
+    if hasattr(agent_cfg, "algorithm") and hasattr(agent_cfg.algorithm, "model_cfg"):
+        agent_cfg.algorithm.model_cfg["use_vae_latent"] = True
+        agent_cfg.algorithm.model_cfg["vae_obs_group"] = "observations_vae"
+
+
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     """Train with RSL-RL agent."""
@@ -120,6 +137,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     agent_cfg.max_iterations = (
         args_cli.max_iterations if args_cli.max_iterations is not None else agent_cfg.max_iterations
     )
+    if args_cli.vae:
+        _enable_vae_mode(env_cfg, agent_cfg)
 
     # handle deprecated configurations
     agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, installed_version)

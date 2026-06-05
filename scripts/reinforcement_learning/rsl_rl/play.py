@@ -29,6 +29,12 @@ parser.add_argument(
 )
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument(
+    "--vae",
+    action="store_true",
+    default=False,
+    help="Enable VAE latent visual observations for tasks that support it.",
+)
+parser.add_argument(
     "--use_pretrained_checkpoint",
     action="store_true",
     help="Use the pre-trained checkpoint from Nucleus.",
@@ -94,6 +100,17 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 # PLACEHOLDER: Extension template (do not remove this comment)
 
 
+def _enable_vae_mode(env_cfg: DirectRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
+    if not hasattr(env_cfg, "set_vae_mode"):
+        raise ValueError(f"--vae was requested, but task '{args_cli.task}' does not expose a VAE mode.")
+    env_cfg.set_vae_mode(True)
+    if hasattr(agent_cfg, "obs_groups"):
+        agent_cfg.obs_groups["actor"] = ["observations", "observations_vae", "observations_map"]
+    if hasattr(agent_cfg, "algorithm") and hasattr(agent_cfg.algorithm, "model_cfg"):
+        agent_cfg.algorithm.model_cfg["use_vae_latent"] = True
+        agent_cfg.algorithm.model_cfg["vae_obs_group"] = "observations_vae"
+
+
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     """Play with RSL-RL agent."""
@@ -104,6 +121,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # override configurations with non-hydra CLI arguments
     agent_cfg: RslRlBaseRunnerCfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
+    if args_cli.vae:
+        _enable_vae_mode(env_cfg, agent_cfg)
 
     # handle deprecated configurations
     agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, installed_version)

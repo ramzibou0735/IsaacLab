@@ -16,8 +16,8 @@ from isaaclab.utils.coverage import CoverageGrid2D, CoverageGrid2DCfg
 from isaaclab.utils.math import quat_apply, quat_from_euler_xyz
 from isaaclab.utils.vae import DepthVAEEncoder
 
-from warp_perception import GridSpec, WarpRoomPerception
-
+from .active_map import build_local_map_bases, extract_centered_map, project_occupancy_to_bev
+from .active_perception_sensor import ActivePerceptionWarpSensor
 from .base_env import AirGymX152bBaseEnv
 from .base_env_cfg import AirGymX152bBaseEnvCfg
 from .exploration_helpers import (
@@ -59,6 +59,11 @@ PERCEPTION_HEIGHT = 135
 PERCEPTION_HFOV_DEG = 87.0
 PERCEPTION_MAX_RANGE = 10.0
 PERCEPTION_FREE_SAMPLES = 48
+OCCUPANCY_MAP_BOUNDS_MIN = (-6.0, -4.0, -3.0)
+OCCUPANCY_MAP_BOUNDS_MAX = (6.0, 4.0, 3.0)
+OCCUPANCY_MAP_SHAPE = (121, 81, 61)
+LOCAL_MAP_SIZE = 21
+LOCAL_MAP_CELL_SIZE = 0.1
 # Box half-extents in collection order (walls N, S, E, W; then pillars), derived
 # from the cuboid sizes in make_exploration_room_cfg().
 WALL_HALF_EXTENTS = torch.tensor(
@@ -72,8 +77,44 @@ WALL_HALF_EXTENTS = torch.tensor(
 )
 PILLAR_HALF_EXTENT = (0.25, 0.25, 0.5 * PILLAR_HEIGHT)  # 0.5 x 0.5 x 2.2
 PATH_COVERAGE_REWARD_SCALE = 0.5
-FREE_INFO_GAIN_REWARD_SCALE = 1.0
-OCCUPIED_INFO_GAIN_REWARD_SCALE = 0.5
+FREE_INFO_GAIN_REWARD_SCALE = 0.5
+OCCUPIED_INFO_GAIN_REWARD_SCALE = 0.25
+ALIVE_REWARD_SCALE = 0.4
+COLLISION_PENALTY_SCALE = -400.0
+BOUNDS_PENALTY_SCALE = -300.0
+HEIGHT_PENALTY_SCALE = -100.0
+LOW_HEIGHT_SOFT_LIMIT = 0.6
+HIGH_HEIGHT_SOFT_LIMIT = 1.7
+HEIGHT_SOFT_PENALTY_SCALE = -1.0
+CURRICULUM_STAGES = (
+    {
+        "active_pillars": 0,
+        "spawn_z_jitter": 0.05,
+        "yaw_range": 0.0,
+        "pillar_spacing": 2.0,
+        "spawn_clearance": 2.0,
+        "camera_additive_noise_std": 0.0,
+        "camera_multiplicative_noise_std": 0.0,
+    },
+    {
+        "active_pillars": 0,
+        "spawn_z_jitter": 0.05,
+        "yaw_range": math.pi,
+        "pillar_spacing": 2.0,
+        "spawn_clearance": 2.0,
+        "camera_additive_noise_std": 0.02,
+        "camera_multiplicative_noise_std": 0.05,
+    },
+    {
+        "active_pillars": 2,
+        "spawn_z_jitter": 0.05,
+        "yaw_range": math.pi,
+        "pillar_spacing": 2.0,
+        "spawn_clearance": 2.0,
+        "camera_additive_noise_std": 0.02,
+        "camera_multiplicative_noise_std": 0.05,
+    },
+)
 WALL_XY = torch.tensor(
     [[0.0, 5.1], [0.0, -5.1], [5.1, 0.0], [-5.1, 0.0]],
     dtype=torch.float32,
@@ -101,15 +142,25 @@ class AirGymX152bExplorationEnvCfg(AirGymX152bBaseEnvCfg):
     perception_hfov_deg = PERCEPTION_HFOV_DEG
     perception_free_samples = PERCEPTION_FREE_SAMPLES
     perception_use_cuda_graph = False
+    occupancy_map_shape = OCCUPANCY_MAP_SHAPE
+    local_map_size = LOCAL_MAP_SIZE
+    local_map_cell_size = LOCAL_MAP_CELL_SIZE
 
     # Frozen depth-VAE encoder (visual observation backbone).
     vae_weights_path: str | None = None
     vae_latent_dims = 64
     vae_return_sampled_latent = False
 
+    # Exploration curriculum. Disabled mode preserves the full current task.
+    curriculum_enabled = True
+    curriculum_stage = 0
+    curriculum_window_episodes = 256
+    curriculum_min_episodes = 128
+    curriculum_inactive_pillar_xy = (0.0, 6.5)
+
     def __post_init__(self):
         super().__post_init__()
-        self.observation_space = 17 + self.action_space
+        self.observation_space = 17 + self.action_space + self.vae_latent_dims
 
 
 class AirGymX152bExplorationEnv(AirGymX152bBaseEnv):
@@ -157,10 +208,15 @@ class AirGymX152bExplorationEnv(AirGymX152bBaseEnv):
             "coverage_reward": torch.zeros((self.num_envs,), device=self.device),
             "proximity_penalty": torch.zeros((self.num_envs,), device=self.device),
             "collision_penalty": torch.zeros((self.num_envs,), device=self.device),
+            "low_height_soft_penalty": torch.zeros((self.num_envs,), device=self.device),
+            "high_height_soft_penalty": torch.zeros((self.num_envs,), device=self.device),
         }
         self._last_collision_termination = torch.zeros((self.num_envs,), device=self.device, dtype=torch.bool)
         self._last_out_of_bounds_termination = torch.zeros((self.num_envs,), device=self.device, dtype=torch.bool)
         self._last_bad_height_termination = torch.zeros((self.num_envs,), device=self.device, dtype=torch.bool)
+        self._curriculum_stage = self._clamp_curriculum_stage(int(self.cfg.curriculum_stage))
+        self._curriculum_episode_history: list[dict[str, float]] = []
+        self._curriculum_stage_advanced = False
 
         x_centers = ROOM_X_LIMITS[0] + VISIBILITY_GRID_CELL_SIZE * (
             torch.arange(self._visibility_grid_h, device=self.device, dtype=torch.float32) + 0.5
@@ -174,6 +230,12 @@ class AirGymX152bExplorationEnv(AirGymX152bBaseEnv):
             ROOM_X_LIMITS[1] - ROOM_X_LIMITS[0],
             ROOM_Y_LIMITS[1] - ROOM_Y_LIMITS[0],
         )
+        self._local_map_index_base, self._local_map_position_base = build_local_map_bases(
+            self.num_envs,
+            self.cfg.local_map_size,
+            self.cfg.local_map_cell_size,
+            self.device,
+        )
 
     def _reset_idx(self, env_ids: torch.Tensor | None):
         if env_ids is None or len(env_ids) == self.num_envs:
@@ -183,25 +245,17 @@ class AirGymX152bExplorationEnv(AirGymX152bBaseEnv):
         super()._reset_idx(env_ids)
 
     def _setup_perception(self) -> None:
-        """Construct the fused Warp perception sensor and push static box geometry."""
+        """Construct the mesh-based active-perception Warp sensor."""
         num_boxes = int(self._obstacles.num_objects)
-        critic_grid = GridSpec(
-            CRITIC_GRID_X_LIMITS, CRITIC_GRID_Y_LIMITS, CRITIC_GRID_Z_LIMITS, CRITIC_GRID_CELL_SIZE
-        )
-        vis_grid = GridSpec(ROOM_X_LIMITS, ROOM_Y_LIMITS, VISIBILITY_GRID_Z_LIMITS, VISIBILITY_GRID_CELL_SIZE)
-        self._perception = WarpRoomPerception(
+        self._perception = ActivePerceptionWarpSensor(
             self.num_envs,
             num_boxes,
             height=self.cfg.perception_height,
             width=self.cfg.perception_width,
             horizontal_fov_deg=self.cfg.perception_hfov_deg,
             max_range=self.cfg.camera_max_distance,
-            critic_grid=critic_grid,
-            vis_grid=vis_grid,
-            grid_stride=CRITIC_GRID_STRIDE,
-            free_samples=self.cfg.perception_free_samples,
+            map_shape=self.cfg.occupancy_map_shape,
             device=self.device,
-            use_cuda_graph=self.cfg.perception_use_cuda_graph,
         )
         self._perception.set_env_origins(self._env_origins)
         pillar_half = torch.tensor(PILLAR_HALF_EXTENT, device=self.device, dtype=torch.float32).expand(
@@ -212,6 +266,7 @@ class AirGymX152bExplorationEnv(AirGymX152bBaseEnv):
 
     def _reset_task(self, env_ids: torch.Tensor):
         num_resets = len(env_ids)
+        stage = self._curriculum_settings()
         spawn_pos = sample_spawn_positions(
             num_resets,
             self.device,
@@ -219,20 +274,35 @@ class AirGymX152bExplorationEnv(AirGymX152bBaseEnv):
             y_limits=ROOM_Y_LIMITS,
             z_height=FLY_HEIGHT,
             xy_margin=SPAWN_MARGIN,
-            z_jitter=0.15,
+            z_jitter=float(stage["spawn_z_jitter"]),
         )
-        spawn_yaw = sample_yaws(num_resets, self.device)
-        pillar_xy = sample_pillar_positions(
-            num_resets,
-            self._num_pillars,
-            self.device,
-            x_limits=ROOM_X_LIMITS,
-            y_limits=ROOM_Y_LIMITS,
-            spawn_xy=spawn_pos[:, :2],
-            wall_margin=PILLAR_WALL_MARGIN,
-            pillar_spacing=PILLAR_SPACING,
-            spawn_clearance=SPAWN_CLEARANCE,
-        )
+        spawn_yaw = self._sample_curriculum_yaws(num_resets, float(stage["yaw_range"]))
+        active_pillars = min(int(stage["active_pillars"]), self._num_pillars)
+        if active_pillars > 0:
+            active_pillar_xy = sample_pillar_positions(
+                num_resets,
+                active_pillars,
+                self.device,
+                x_limits=ROOM_X_LIMITS,
+                y_limits=ROOM_Y_LIMITS,
+                spawn_xy=spawn_pos[:, :2],
+                wall_margin=PILLAR_WALL_MARGIN,
+                pillar_spacing=float(stage["pillar_spacing"]),
+                spawn_clearance=float(stage["spawn_clearance"]),
+            )
+        else:
+            active_pillar_xy = torch.zeros((num_resets, 0, 2), device=self.device, dtype=torch.float32)
+        inactive_count = self._num_pillars - active_pillars
+        if inactive_count > 0:
+            inactive_xy = torch.tensor(
+                self.cfg.curriculum_inactive_pillar_xy,
+                device=self.device,
+                dtype=torch.float32,
+            ).view(1, 1, 2)
+            inactive_xy = inactive_xy.expand(num_resets, inactive_count, 2)
+            pillar_xy = torch.cat((active_pillar_xy, inactive_xy), dim=1)
+        else:
+            pillar_xy = active_pillar_xy
         obstacle_pos, obstacle_quat = build_room_object_state(
             self._wall_xy,
             pillar_xy,
@@ -267,15 +337,52 @@ class AirGymX152bExplorationEnv(AirGymX152bBaseEnv):
         self._update_perception(force=True)
         self._update_known_space_from_depth(env_ids)
 
+    def _clamp_curriculum_stage(self, stage: int) -> int:
+        return max(0, min(stage, len(CURRICULUM_STAGES) - 1))
+
+    def _curriculum_settings(self) -> dict[str, float | int]:
+        if self.cfg.curriculum_enabled:
+            return CURRICULUM_STAGES[self._curriculum_stage]
+        return {
+            "active_pillars": self._num_pillars,
+            "spawn_z_jitter": 0.15,
+            "yaw_range": math.pi,
+            "pillar_spacing": PILLAR_SPACING,
+            "spawn_clearance": SPAWN_CLEARANCE,
+            "camera_additive_noise_std": self.cfg.camera_additive_noise_std,
+            "camera_multiplicative_noise_std": self.cfg.camera_multiplicative_noise_std,
+        }
+
+    def _sample_curriculum_yaws(self, num_resets: int, yaw_range: float) -> torch.Tensor:
+        if yaw_range <= 0.0:
+            return torch.zeros((num_resets,), device=self.device, dtype=torch.float32)
+        if yaw_range >= math.pi:
+            return sample_yaws(num_resets, self.device)
+        return 2.0 * yaw_range * torch.rand((num_resets,), device=self.device, dtype=torch.float32) - yaw_range
+
+    def _camera_additive_noise_std(self) -> float:
+        return float(self._curriculum_settings()["camera_additive_noise_std"])
+
+    def _camera_multiplicative_noise_std(self) -> float:
+        return float(self._curriculum_settings()["camera_multiplicative_noise_std"])
+
     def _resolve_map_env_ids(self, env_ids: torch.Tensor | None) -> torch.Tensor:
         if env_ids is None:
             return torch.arange(self.num_envs, device=self.device, dtype=torch.long)
         return env_ids.to(device=self.device, dtype=torch.long)
 
     def _room_visibility_grid(self) -> torch.Tensor:
-        """Env-local free/occupied visibility grid for this step (from Warp)."""
+        """Env-local free/occupied visibility grid projected from the 3D map."""
         self._update_perception()
-        return self._perception.visibility_grid
+        return project_occupancy_to_bev(
+            self._perception.occupancy_map,
+            x_limits=ROOM_X_LIMITS,
+            y_limits=ROOM_Y_LIMITS,
+            z_limits=VISIBILITY_GRID_Z_LIMITS,
+            cell_size=VISIBILITY_GRID_CELL_SIZE,
+            map_bounds_min=OCCUPANCY_MAP_BOUNDS_MIN,
+            map_bounds_max=OCCUPANCY_MAP_BOUNDS_MAX,
+        )
 
     def _update_known_space_from_depth(self, env_ids: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         env_ids = self._resolve_map_env_ids(env_ids)
@@ -367,13 +474,8 @@ class AirGymX152bExplorationEnv(AirGymX152bBaseEnv):
         )
 
     def _critic_grid_observation(self) -> torch.Tensor:
-        """Ego-local two-channel critic occupancy grid from the Warp sensor.
-
-        Mirrors the previous PyTorch helper's semantics: occupied cells are
-        dilated by one cell and free cells beneath occupied ones are cleared.
-        """
-        self._update_perception()
-        grid = self._perception.critic_grid
+        """Compatibility two-channel critic grid projected from the 3D map."""
+        grid = self._room_visibility_grid()
         occupied = grid[:, 1]
         if CRITIC_GRID_INFLATION_RADIUS > 0:
             ksize = 2 * CRITIC_GRID_INFLATION_RADIUS + 1
@@ -383,6 +485,20 @@ class AirGymX152bExplorationEnv(AirGymX152bBaseEnv):
         free = torch.where(occupied > 0, torch.zeros_like(grid[:, 0]), grid[:, 0])
         return torch.stack((free, occupied), dim=1)
 
+    def _local_map_observation(self) -> torch.Tensor:
+        self._update_perception()
+        local_map = extract_centered_map(
+            self._perception.occupancy_map,
+            self.cfg.local_map_size,
+            self._root_pos_local(),
+            self._robot.data.root_quat_w,
+            OCCUPANCY_MAP_BOUNDS_MIN,
+            OCCUPANCY_MAP_BOUNDS_MAX,
+            self._local_map_index_base,
+            self._local_map_position_base,
+        )
+        return local_map.unsqueeze(1)
+
     def _get_task_observations(self) -> dict[str, torch.Tensor]:
         # Perception (depth/critic/visibility) is refreshed for all envs in the
         # reward step and re-run for reset envs inside _reset_task, so the cache is
@@ -391,9 +507,13 @@ class AirGymX152bExplorationEnv(AirGymX152bBaseEnv):
         self._update_perception()
         obs = self._state_observation()
         latent = self._vae.encode(self._camera_depth_metric_image())
+        observations = torch.cat((obs, latent), dim=-1)
+        observations_map = self._local_map_observation()
         return {
             "policy": obs,
             "observation": obs,
+            "observations": observations,
+            "observations_map": observations_map,
             "latent": latent,
             "critic_grid": self._critic_grid_observation(),
         }
@@ -418,8 +538,14 @@ class AirGymX152bExplorationEnv(AirGymX152bBaseEnv):
 
         up_axis = torch.tensor([0.0, 0.0, 1.0], device=self.device).repeat(self.num_envs, 1)
         ups = quat_apply(self._robot.data.root_quat_w, up_axis)
-        upright_reward = 0.3 * torch.square((ups[:, 2] + 1.0) / 2.0)
-        height_reward = 0.3 * torch.exp(-4.0 * torch.square(root_pos_local[:, 2] - FLY_HEIGHT))
+        upright_reward = 0.3 * torch.square(torch.clamp(ups[:, 2], min=0.0))
+        height_reward = 0.3 * torch.exp(-6.0 * torch.square(root_pos_local[:, 2] - FLY_HEIGHT))
+        low_height_soft_penalty = HEIGHT_SOFT_PENALTY_SCALE * torch.clamp(
+            LOW_HEIGHT_SOFT_LIMIT - root_pos_local[:, 2], min=0.0
+        )
+        high_height_soft_penalty = HEIGHT_SOFT_PENALTY_SCALE * torch.clamp(
+            root_pos_local[:, 2] - HIGH_HEIGHT_SOFT_LIMIT, min=0.0
+        )
 
         action_diff = self._actions - self._previous_actions
         action_smoothness_reward = 0.1 * torch.exp(-torch.linalg.vector_norm(action_diff, dim=-1))
@@ -430,13 +556,25 @@ class AirGymX152bExplorationEnv(AirGymX152bBaseEnv):
             + OCCUPIED_INFO_GAIN_REWARD_SCALE * new_occupied_cells.to(dtype=torch.float32)
         )
         coverage_reward = path_coverage_reward
-        alive_reward = torch.full((self.num_envs,), 0.1, device=self.device)
+        alive_reward = torch.full((self.num_envs,), ALIVE_REWARD_SCALE, device=self.device)
 
         out_of_bounds = ~in_bounds
         bad_height = (root_pos_local[:, 2] < 0.35) | (root_pos_local[:, 2] > 2.0)
-        collision_penalty = torch.where(collision, torch.full((self.num_envs,), -50.0, device=self.device), 0.0)
-        bounds_penalty = torch.where(out_of_bounds, torch.full((self.num_envs,), -25.0, device=self.device), 0.0)
-        height_penalty = torch.where(bad_height, torch.full((self.num_envs,), -20.0, device=self.device), 0.0)
+        collision_penalty = torch.where(
+            collision,
+            torch.full((self.num_envs,), COLLISION_PENALTY_SCALE, device=self.device),
+            0.0,
+        )
+        bounds_penalty = torch.where(
+            out_of_bounds,
+            torch.full((self.num_envs,), BOUNDS_PENALTY_SCALE, device=self.device),
+            0.0,
+        )
+        height_penalty = torch.where(
+            bad_height,
+            torch.full((self.num_envs,), HEIGHT_PENALTY_SCALE, device=self.device),
+            0.0,
+        )
 
         reward = (
             coverage_reward
@@ -444,6 +582,8 @@ class AirGymX152bExplorationEnv(AirGymX152bBaseEnv):
             + alive_reward
             + upright_reward
             + height_reward
+            + low_height_soft_penalty
+            + high_height_soft_penalty
             + action_smoothness_reward
             + spin_reward
             + proximity_penalty
@@ -464,6 +604,8 @@ class AirGymX152bExplorationEnv(AirGymX152bBaseEnv):
             "alive_reward": alive_reward,
             "upright_reward": upright_reward,
             "height_reward": height_reward,
+            "low_height_soft_penalty": low_height_soft_penalty,
+            "high_height_soft_penalty": high_height_soft_penalty,
             "action_smoothness_reward": action_smoothness_reward,
             "spin_reward": spin_reward,
             "proximity_penalty": proximity_penalty,
@@ -477,10 +619,12 @@ class AirGymX152bExplorationEnv(AirGymX152bBaseEnv):
         return reward, reward_info
 
     def _log_completed_episode_metrics(self, env_ids: torch.Tensor) -> None:
+        self._curriculum_stage_advanced = False
         episode_lengths = self.episode_length_buf[env_ids].to(dtype=torch.float32)
         completed_episode = self.reset_terminated[env_ids] | self.reset_time_outs[env_ids]
         valid_episode = completed_episode & (episode_lengths > 0)
         if not torch.any(valid_episode):
+            self.extras["log"] = self._curriculum_log()
             return
 
         valid_env_ids = env_ids[valid_episode]
@@ -505,8 +649,115 @@ class AirGymX152bExplorationEnv(AirGymX152bBaseEnv):
         log["Episode_Termination/time_out_rate"] = self.reset_time_outs[valid_env_ids].to(dtype=torch.float32).mean()
         log["Metrics/coverage_ratio"] = coverage_ratio.mean()
         log["Metrics/known_space_ratio"] = known_space_ratio.mean()
+        self._record_curriculum_episodes(valid_env_ids, episode_lengths, coverage_ratio, known_space_ratio)
+        self._maybe_advance_curriculum()
+        log.update(self._curriculum_log())
 
         self.extras["log"] = log
+
+    def _record_curriculum_episodes(
+        self,
+        env_ids: torch.Tensor,
+        episode_lengths: torch.Tensor,
+        coverage_ratio: torch.Tensor,
+        known_space_ratio: torch.Tensor,
+    ) -> None:
+        if not self.cfg.curriculum_enabled:
+            return
+
+        for i, env_id in enumerate(env_ids.tolist()):
+            self._curriculum_episode_history.append(
+                {
+                    "episode_length": float(episode_lengths[i].item()),
+                    "collision": float(self._last_collision_termination[env_id].item()),
+                    "out_of_bounds": float(self._last_out_of_bounds_termination[env_id].item()),
+                    "bad_height": float(self._last_bad_height_termination[env_id].item()),
+                    "time_out": float(self.reset_time_outs[env_id].item()),
+                    "coverage_ratio": float(coverage_ratio[i].item()),
+                    "known_space_ratio": float(known_space_ratio[i].item()),
+                }
+            )
+
+        max_window = max(1, int(self.cfg.curriculum_window_episodes))
+        if len(self._curriculum_episode_history) > max_window:
+            self._curriculum_episode_history = self._curriculum_episode_history[-max_window:]
+
+    def _curriculum_window_metrics(self) -> dict[str, float]:
+        count = len(self._curriculum_episode_history)
+        if count == 0:
+            return {
+                "episode_count": 0.0,
+                "mean_episode_length": 0.0,
+                "collision_rate": 0.0,
+                "out_of_bounds_rate": 0.0,
+                "bad_height_rate": 0.0,
+                "time_out_rate": 0.0,
+                "coverage_ratio": 0.0,
+                "known_space_ratio": 0.0,
+            }
+
+        metrics = {"episode_count": float(count)}
+        for key in (
+            "episode_length",
+            "collision",
+            "out_of_bounds",
+            "bad_height",
+            "time_out",
+            "coverage_ratio",
+            "known_space_ratio",
+        ):
+            metrics[key] = sum(item[key] for item in self._curriculum_episode_history) / count
+        metrics["mean_episode_length"] = metrics.pop("episode_length")
+        metrics["collision_rate"] = metrics.pop("collision")
+        metrics["out_of_bounds_rate"] = metrics.pop("out_of_bounds")
+        metrics["bad_height_rate"] = metrics.pop("bad_height")
+        metrics["time_out_rate"] = metrics.pop("time_out")
+        return metrics
+
+    def _maybe_advance_curriculum(self) -> None:
+        if not self.cfg.curriculum_enabled or self._curriculum_stage >= len(CURRICULUM_STAGES) - 1:
+            return
+        if len(self._curriculum_episode_history) < int(self.cfg.curriculum_min_episodes):
+            return
+
+        metrics = self._curriculum_window_metrics()
+        should_advance = False
+        if self._curriculum_stage == 0:
+            should_advance = (
+                metrics["time_out_rate"] > 0.85
+                and metrics["bad_height_rate"] < 0.05
+                and metrics["collision_rate"] < 0.05
+                and metrics["mean_episode_length"] >= 1800.0
+            )
+        elif self._curriculum_stage == 1:
+            should_advance = (
+                metrics["known_space_ratio"] > 0.45
+                and metrics["coverage_ratio"] > 0.20
+                and metrics["out_of_bounds_rate"] < 0.10
+                and metrics["time_out_rate"] > 0.75
+            )
+
+        if should_advance:
+            self._curriculum_stage += 1
+            self._curriculum_stage_advanced = True
+            self._curriculum_episode_history.clear()
+
+    def _curriculum_log(self) -> dict[str, float | int]:
+        stage = self._curriculum_settings()
+        metrics = self._curriculum_window_metrics()
+        return {
+            "Curriculum/stage": self._curriculum_stage if self.cfg.curriculum_enabled else -1,
+            "Curriculum/active_pillars": int(stage["active_pillars"]),
+            "Curriculum/stage_advanced": int(self._curriculum_stage_advanced),
+            "Curriculum/window_episode_count": metrics["episode_count"],
+            "Curriculum/window_time_out_rate": metrics["time_out_rate"],
+            "Curriculum/window_collision_rate": metrics["collision_rate"],
+            "Curriculum/window_out_of_bounds_rate": metrics["out_of_bounds_rate"],
+            "Curriculum/window_bad_height_rate": metrics["bad_height_rate"],
+            "Curriculum/window_mean_episode_length": metrics["mean_episode_length"],
+            "Curriculum/window_coverage_ratio": metrics["coverage_ratio"],
+            "Curriculum/window_known_space_ratio": metrics["known_space_ratio"],
+        }
 
     def _compute_terminated(self) -> torch.Tensor:
         root_pos_local = self._root_pos_local()

@@ -20,6 +20,7 @@ from isaaclab.utils.math import (
     normalize,
     quat_apply,
     quat_from_matrix,
+    quat_mul,
     quat_unique,
     wrap_to_pi,
 )
@@ -61,6 +62,9 @@ class AirGymX152bBaseEnv(DirectRLEnv):
         self._cam_offset_b = torch.tensor(self.cfg.camera_offset_pos, device=self.device, dtype=torch.float32).view(
             1, 3
         )
+        self._cam_frame_quat_b = torch.tensor(
+            (0.5, -0.5, 0.5, -0.5), device=self.device, dtype=torch.float32
+        ).view(1, 4)
 
         self._prop_body_ids = torch.tensor(
             self._robot.find_bodies(["prop_1", "prop_2", "prop_3", "prop_4"], preserve_order=True)[0],
@@ -278,8 +282,8 @@ class AirGymX152bBaseEnv(DirectRLEnv):
         ones = torch.ones_like(yaw)
         world_to_local = torch.stack(
             (
-                torch.stack((cos_yaw, -sin_yaw, zeros), dim=-1),
-                torch.stack((sin_yaw, cos_yaw, zeros), dim=-1),
+                torch.stack((cos_yaw, sin_yaw, zeros), dim=-1),
+                torch.stack((-sin_yaw, cos_yaw, zeros), dim=-1),
                 torch.stack((zeros, zeros, ones), dim=-1),
             ),
             dim=1,
@@ -318,8 +322,8 @@ class AirGymX152bBaseEnv(DirectRLEnv):
         root_pos_w = self._robot.data.root_pos_w
         root_quat_w = self._robot.data.root_quat_w
         cam_pos_w = root_pos_w + quat_apply(root_quat_w, self._cam_offset_b.expand(self.num_envs, -1))
-        # Camera offset rotation is identity, so the camera shares the body orientation.
-        self._perception.compute(cam_pos_w, root_quat_w, world_to_local, root_pos_w)
+        cam_quat_w = quat_mul(root_quat_w, self._cam_frame_quat_b.expand(self.num_envs, -1))
+        self._perception.compute(cam_pos_w, cam_quat_w, world_to_local, root_pos_w)
         self._perception_valid = True
         # Depth buffer changed; invalidate derived (noisy/normalized) caches.
         self._camera_metric_image = None
@@ -336,12 +340,20 @@ class AirGymX152bBaseEnv(DirectRLEnv):
                 depth = self._perception.depth.unsqueeze(1)
             else:
                 depth = self._onboard_camera.data.output["depth"].permute(0, 3, 1, 2).contiguous()
-            if self.cfg.camera_additive_noise_std > 0.0:
-                depth = depth + self.cfg.camera_additive_noise_std * self.cfg.camera_max_distance * torch.randn_like(depth)
-            if self.cfg.camera_multiplicative_noise_std > 0.0:
-                depth = depth * (1.0 + self.cfg.camera_multiplicative_noise_std * torch.randn_like(depth))
+            additive_noise_std = self._camera_additive_noise_std()
+            multiplicative_noise_std = self._camera_multiplicative_noise_std()
+            if additive_noise_std > 0.0:
+                depth = depth + additive_noise_std * self.cfg.camera_max_distance * torch.randn_like(depth)
+            if multiplicative_noise_std > 0.0:
+                depth = depth * (1.0 + multiplicative_noise_std * torch.randn_like(depth))
             self._camera_metric_image = depth.clamp(0.0, self.cfg.camera_max_distance)
         return self._camera_metric_image
+
+    def _camera_additive_noise_std(self) -> float:
+        return float(self.cfg.camera_additive_noise_std)
+
+    def _camera_multiplicative_noise_std(self) -> float:
+        return float(self.cfg.camera_multiplicative_noise_std)
 
     def _camera_depth_image(self) -> torch.Tensor:
         if self._camera_image is None:
